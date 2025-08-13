@@ -126,13 +126,13 @@ OUTPUT:
         Files: Creates <filename>.zst in same directory
         Directories: Creates <dirname>.zst archive
         STDIN: Creates stdin_output_<timestamp>.zst
-    
+
     Decompression:
         Files: Restores original <filename>
         Archives: Recreates original directory structure
         Cleanup: Optionally removes .zst files after extraction
 
-For more information, visit: https://github.com/yourusername/kzip
+For more information, visit: https://github.com/Karthikdude/kzip
         """
 
     def validate_args(self, args) -> None:
@@ -266,6 +266,45 @@ class CompressionEngine:
                 output_path.unlink()  # Clean up partial file
             raise KZipError(f"Compression failed: {str(e)}")
 
+    def _build_tar_archive(self, temp_tar_file: io.BytesIO, input_path: Path,
+                           verbose: bool, start_time: float,
+                           file_count: int) -> None:
+        """Helper to build tar archive in a thread to avoid blocking"""
+        files_processed = 0
+        current_file = ""
+        original_size = 0
+
+        with tarfile.open(fileobj=temp_tar_file, mode='w') as tar:
+            for root, dirs, files in os.walk(input_path):
+                for file in files:
+                    file_path = Path(root) / file
+                    current_file = str(file_path.relative_to(input_path.parent))
+
+                    try:
+                        arcname = file_path.relative_to(input_path.parent)
+                        tar.add(file_path, arcname=arcname)
+
+                        file_size = file_path.stat().st_size
+                        original_size += file_size
+                        files_processed += 1
+
+                        if verbose and files_processed % 100 == 0:
+                            elapsed = time.time() - start_time
+                            speed = (original_size / 1024 / 1024
+                                     ) / elapsed if elapsed > 0 else 0
+                            progress_line = f"Files processed: {files_processed:,}/{file_count:,} | Current: {current_file} | Speed: {speed:.1f} MB/s"
+                            if len(progress_line) > 120:
+                                progress_line = progress_line[:117] + "..."
+                            print(f"\r{progress_line:<120}", end="", flush=True)
+
+                    except (OSError, IOError) as e:
+                        if verbose:
+                            self.console.print(
+                                f"[yellow]Warning: Skipping {file_path}: {e}")
+                        continue
+                    except KeyboardInterrupt:
+                        raise  # Propagate interrupt
+
     async def compress_directory(
             self,
             input_path: Path,
@@ -278,10 +317,8 @@ class CompressionEngine:
         compressed_size = 0
 
         try:
-            # Create compressor
             compressor = zstd.ZstdCompressor(level=compression_level)
 
-            # Count files and calculate total size for progress
             file_count = 0
             total_size = 0
 
@@ -294,72 +331,20 @@ class CompressionEngine:
                             total_size += file_path.stat().st_size
                             file_count += 1
                         except (OSError, IOError):
-                            continue  # Skip inaccessible files
+                            continue
 
                 self.console.print(
                     f"Found {file_count:,} files ({total_size / 1024 / 1024:.1f} MB total)"
                 )
 
-            # Setup progress tracking
-            progress = None
-            task_id = None
-
-            if verbose:
-                # We'll use custom single-line progress instead of Rich progress
-                progress = None
-                task_id = None
-
-            # Create tar archive first, then compress
+            # Create tar archive and compress using streaming
             with tempfile.NamedTemporaryFile() as temp_tar:
-                with tarfile.open(fileobj=temp_tar, mode='w') as tar:
-                    files_processed = 0
-                    current_file = ""
+                # Build tar archive using asyncio.to_thread to avoid blocking
+                await asyncio.to_thread(self._build_tar_archive,
+                                        temp_tar, input_path, verbose,
+                                        start_time, file_count)
 
-                    for root, dirs, files in os.walk(input_path):
-                        for file in files:
-                            file_path = Path(root) / file
-                            current_file = str(
-                                file_path.relative_to(input_path.parent))
-
-                            try:
-                                # Add file to tar with relative path
-                                arcname = file_path.relative_to(
-                                    input_path.parent)
-                                tar.add(file_path, arcname=arcname)
-
-                                file_size = file_path.stat().st_size
-                                original_size += file_size
-                                files_processed += 1
-
-                                # Update status line every 100 files (single line, edit in place)
-                                if verbose and files_processed % 100 == 0:
-                                    elapsed = time.time() - start_time
-                                    speed = (original_size / 1024 / 1024
-                                             ) / elapsed if elapsed > 0 else 0
-                                    # Clear line and update in place using \r and terminal control
-                                    progress_line = f"Files processed: {files_processed:,}/{file_count:,} | Current: {current_file} | Speed: {speed:.1f} MB/s"
-                                    # Truncate if too long and ensure it overwrites completely
-                                    if len(progress_line) > 120:
-                                        progress_line = progress_line[:117] + "..."
-                                    print(f"\r{progress_line:<120}",
-                                          end="",
-                                          flush=True)
-
-                                # Check for cancellation periodically
-                                if files_processed % 100 == 0:
-                                    await asyncio.sleep(
-                                        0)  # Allow for interruption
-
-                            except (OSError, IOError) as e:
-                                if verbose:
-                                    self.console.print(
-                                        f"[yellow]Warning: Skipping {file_path}: {e}"
-                                    )
-                                continue
-                            except KeyboardInterrupt:
-                                if progress:
-                                    progress.stop()
-                                raise
+                original_size = temp_tar.tell()
 
                 # Show finishing message at 99% before final compression step
                 if verbose:
@@ -369,19 +354,27 @@ class CompressionEngine:
                         "[cyan]Processing completed (99%), finishing compression..."
                     )
 
-                # Now compress the entire tar file
+                # Use streaming compression to avoid loading entire tar into memory
                 temp_tar.seek(0)
-                tar_data = temp_tar.read()
+                compressed_size = 0
 
-                # Compress using the simple compress method (handles framing properly)
-                compressed_data = compressor.compress(tar_data)
-                compressed_size = len(compressed_data)
-
-                # Write compressed data
                 async with aiofiles.open(output_path, 'wb') as output_file:
-                    await output_file.write(compressed_data)
+                    # Use stream_writer for memory-efficient compression
+                    with compressor.stream_writer(output_file._file) as writer:
+                        while True:
+                            chunk = temp_tar.read(self.config.CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            writer.write(chunk)
+                            compressed_size += len(chunk)
 
-            # Create simple progress bar manually for completion
+                            # Allow for interruption during compression
+                            if compressed_size % (self.config.CHUNK_SIZE * 100) == 0:
+                                await asyncio.sleep(0)
+
+                # Get actual compressed size from file
+                compressed_size = output_path.stat().st_size
+
             if verbose:
                 print("\r" + " " * 120 + "\r",
                       end="")  # Clear any remaining progress
@@ -391,18 +384,13 @@ class CompressionEngine:
             return original_size, compressed_size, end_time - start_time
 
         except KeyboardInterrupt:
-            # Handle Ctrl+C gracefully
-            if 'progress' in locals() and progress:
-                progress.stop()
             if output_path.exists():
-                output_path.unlink()  # Clean up partial file
+                output_path.unlink()
             self.console.print("\n[yellow]Compression cancelled by user.")
             raise
         except Exception as e:
-            if 'progress' in locals() and progress:
-                progress.stop()
             if output_path.exists():
-                output_path.unlink()  # Clean up partial file
+                output_path.unlink()
             raise KZipError(f"Directory compression failed: {str(e)}")
 
     async def decompress_file(self,
@@ -528,7 +516,8 @@ class CompressionEngine:
 
                         files_extracted = 0
                         for member in members:
-                            tar.extract(member, output_dir)
+                            # Use asyncio.to_thread for blocking tarfile operations
+                            await asyncio.to_thread(tar.extract, member, output_dir)
                             if member.isfile():
                                 files_extracted += 1
                                 progress.update(
@@ -538,6 +527,7 @@ class CompressionEngine:
 
                         progress.stop()
                     else:
+                        # Use asyncio.to_thread for blocking tarfile operations
                         tar.extractall(output_dir)
 
             end_time = time.time()
