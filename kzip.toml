@@ -1,0 +1,18 @@
+
+# KZip Configuration File
+# Place this file in your home directory as ~/.kziprc or in your project as kzip.toml or .kzip.toml
+
+# Memory and performance settings
+MAX_MEMORY_MB = 4096          # Maximum memory usage in MB
+MAX_CONCURRENT_FILES = 12     # Maximum concurrent file operations
+CHECKPOINT_INTERVAL = 50      # Save progress every N files
+
+# Integrity and safety features
+ENABLE_INTEGRITY_CHECK = true # Verify compression integrity
+AUTO_CLEANUP = false         # Automatically remove source files after compression
+
+# Default output directory (leave empty for same directory as input)
+DEFAULT_OUTPUT_DIR = ""
+
+# Chunk size for streaming operations (64KB default)
+CHUNK_SIZE = 65536

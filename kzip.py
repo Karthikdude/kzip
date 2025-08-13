@@ -14,7 +14,7 @@ import tempfile
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, Union, List, Literal, Protocol
 import io
 
 try:
@@ -27,10 +27,11 @@ try:
                                FileSizeColumn, TransferSpeedColumn)
     from rich.table import Table
     from rich.panel import Panel
+    from pydantic import BaseModel, validator
 except ImportError as e:
     print(f"Required dependency missing: {e}")
     print("Please install required packages:")
-    print("pip install zstandard aiofiles rich")
+    print("pip install zstandard aiofiles rich pydantic")
     sys.exit(1)
 
 
@@ -39,14 +40,39 @@ class KZipError(Exception):
     pass
 
 
+class KZipRetryableError(KZipError):
+    """Errors that can be retried"""
+    pass
+
+async def with_retry(operation, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return await operation()
+        except KZipRetryableError:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+
+
+class CompressionMode(BaseModel):
+    level: int
+    mode: Literal['speed', 'balanced', 'compression']
+
+    @validator('level')
+    def validate_level(cls, v):
+        if not -100 <= v <= 22:
+            raise ValueError('Invalid compression level')
+        return v
+
+
 class ProgressState:
     """Handles checkpoint save/load for resume capability"""
-    
+
     def __init__(self, operation_id: str):
         self.operation_id = operation_id
         self.checkpoint_file = Path(f".kzip_progress_{operation_id}")
-    
-    def save_checkpoint(self, processed_files: List[str], current_position: int, 
+
+    def save_checkpoint(self, processed_files: List[str], current_position: int,
                        total_files: int, bytes_processed: int):
         """Save current progress to checkpoint file"""
         checkpoint_data = {
@@ -56,13 +82,13 @@ class ProgressState:
             'bytes_processed': bytes_processed,
             'timestamp': time.time()
         }
-        
+
         try:
             with open(self.checkpoint_file, 'w') as f:
                 json.dump(checkpoint_data, f, indent=2)
         except Exception:
             pass  # Silently fail if unable to save checkpoint
-    
+
     def load_checkpoint(self) -> Optional[dict]:
         """Load progress from checkpoint file"""
         try:
@@ -72,7 +98,7 @@ class ProgressState:
         except Exception:
             pass
         return None
-    
+
     def cleanup(self):
         """Remove checkpoint file after successful completion"""
         try:
@@ -84,11 +110,11 @@ class ProgressState:
 
 class ResourceMonitor:
     """Monitors system resources and adjusts performance accordingly"""
-    
+
     def __init__(self, max_workers: int = 8):
         self.max_workers = max_workers
         self.current_workers = min(4, max_workers)  # Start conservatively
-        
+
     def should_throttle(self) -> bool:
         """Check if system resources are under stress"""
         try:
@@ -97,16 +123,16 @@ class ResourceMonitor:
             return memory_percent > 85 or cpu_percent > 90
         except Exception:
             return False  # Conservative fallback
-    
+
     def adjust_workers(self) -> int:
         """Dynamically adjust worker count based on system resources"""
         if self.should_throttle():
             self.current_workers = max(1, self.current_workers // 2)
         else:
             self.current_workers = min(self.max_workers, self.current_workers + 1)
-        
+
         return self.current_workers
-    
+
     def get_memory_usage_mb(self) -> float:
         """Get current memory usage in MB"""
         try:
@@ -129,10 +155,56 @@ class CompressionConfig:
 
     # Memory limits
     MAX_MEMORY_MB = 3072  # 3GB
-    
+
     # Parallel processing limits
     MAX_CONCURRENT_FILES = 10
     CHECKPOINT_INTERVAL = 100  # Save progress every N files
+
+    def __init__(self, level: int = 9, max_workers: int = 8, chunk_size: int = 65536):
+        self.level = level
+        self.max_workers = max_workers
+        self.chunk_size = chunk_size
+
+    @classmethod
+    def load_config(cls, config_file: Optional[Path] = None) -> 'CompressionConfig':
+        """Load configuration from a file or default values"""
+        config_data = {}
+        config_paths = [
+            Path.home() / '.kziprc',
+            Path.cwd() / 'kzip.toml'
+        ]
+
+        if config_file:
+            config_paths.insert(0, config_file)
+
+        loaded = False
+        for path in config_paths:
+            if path.exists():
+                try:
+                    # Assuming TOML format for simplicity, can be extended
+                    with open(path, 'r') as f:
+                        import toml
+                        config_data = toml.load(f)
+                    loaded = True
+                    break
+                except ImportError:
+                    print("[yellow]Warning: toml library not found. Cannot load config file. Install with 'pip install toml'")
+                    break
+                except Exception as e:
+                    print(f"[red]Error loading config file {path}: {e}")
+                    # Continue to next path or use defaults
+
+        # Apply defaults and validated values
+        level = config_data.get('compression', {}).get('level', cls.BALANCED_LEVEL)
+        max_workers = config_data.get('performance', {}).get('max_workers', 8)
+        chunk_size = config_data.get('performance', {}).get('chunk_size', cls.CHUNK_SIZE)
+
+        # Validate compression level
+        if not -100 <= level <= 22:
+            print(f"[yellow]Warning: Invalid compression level '{level}' in config. Using default {cls.BALANCED_LEVEL}.")
+            level = cls.BALANCED_LEVEL
+
+        return cls(level=level, max_workers=max_workers, chunk_size=chunk_size)
 
 
 class KZipCLI:
@@ -140,7 +212,11 @@ class KZipCLI:
 
     def __init__(self):
         self.console = Console()
-        self.config = CompressionConfig()
+        try:
+            self.config = CompressionConfig.load_config()
+        except Exception:
+            # Fallback to default config if loading fails
+            self.config = CompressionConfig()
 
     def create_parser(self) -> argparse.ArgumentParser:
         """Create and configure argument parser"""
@@ -267,7 +343,7 @@ class CompressionEngine:
                 header_data = f.read(4096)
                 if len(header_data) < 512:
                     return False
-                
+
                 # Decompress the header to check for tar magic bytes
                 try:
                     sample = decompressor.decompress(header_data)
@@ -288,40 +364,40 @@ class CompressionEngine:
         elif max_speed:
             return self.config.MAX_SPEED_LEVEL
         else:
-            return self.config.BALANCED_LEVEL
+            return self.config.level
 
-    async def compress_single_file_concurrent(self, file_info: Tuple[Path, Path, int], 
+    async def compress_single_file_concurrent(self, file_info: Tuple[Path, Path, int],
                                             semaphore: asyncio.Semaphore) -> Tuple[str, int, int, bool]:
         """Compress a single file with semaphore control for concurrency"""
         file_path, relative_path, compression_level = file_info
-        
+
         async with semaphore:
             try:
                 # Check if we should throttle based on system resources
                 if self.resource_monitor.should_throttle():
                     await asyncio.sleep(0.1)  # Brief pause if system is stressed
-                
+
                 # Read and compress file
                 async with aiofiles.open(file_path, 'rb') as f:
                     data = await f.read()
-                
+
                 compressor = zstd.ZstdCompressor(level=compression_level)
                 compressed_data = compressor.compress(data)
-                
+
                 return str(relative_path), len(data), len(compressed_data), True
-                
+
             except Exception as e:
                 # Return error info but don't fail the entire operation
                 return str(relative_path), 0, 0, False
 
-    async def compress_files_concurrently(self, files: List[Tuple[Path, Path, int]], 
+    async def compress_files_concurrently(self, files: List[Tuple[Path, Path, int]],
                                         semaphore_limit: int = None) -> List[Tuple[str, int, int, bool]]:
         """Compress multiple files concurrently with dynamic resource management"""
         if semaphore_limit is None:
             semaphore_limit = self.resource_monitor.current_workers
-        
+
         semaphore = asyncio.Semaphore(semaphore_limit)
-        
+
         # Create tasks for concurrent processing
         tasks = []
         for file_info in files:
@@ -329,20 +405,20 @@ class CompressionEngine:
                 self.compress_single_file_concurrent(file_info, semaphore)
             )
             tasks.append(task)
-        
+
         # Process with periodic resource monitoring
         results = []
         for i, task in enumerate(asyncio.as_completed(tasks)):
             result = await task
             results.append(result)
-            
+
             # Dynamically adjust concurrency based on system resources
             if i % 10 == 0:  # Check every 10 files
                 new_limit = self.resource_monitor.adjust_workers()
                 if new_limit != semaphore_limit:
                     semaphore_limit = new_limit
                     # Note: We can't change existing semaphore, but this affects future batches
-        
+
         return results
 
     async def compress_file(self,
@@ -398,7 +474,7 @@ class CompressionEngine:
                     buffer = io.BytesIO()
 
                     while True:
-                        chunk = await input_file.read(self.config.CHUNK_SIZE)
+                        chunk = await input_file.read(self.config.chunk_size)
                         if not chunk:
                             break
 
@@ -435,7 +511,7 @@ class CompressionEngine:
         current_file = ""
         original_size = 0
         processed_files = []
-        
+
         # Load checkpoint if available
         checkpoint = None
         if progress_state:
@@ -469,7 +545,7 @@ class CompressionEngine:
 
                         # Save checkpoint periodically
                         if progress_state and files_processed % self.config.CHECKPOINT_INTERVAL == 0:
-                            progress_state.save_checkpoint(processed_files, files_processed, 
+                            progress_state.save_checkpoint(processed_files, files_processed,
                                                          file_count, original_size)
 
                         if verbose and files_processed % 100 == 0:
@@ -490,7 +566,7 @@ class CompressionEngine:
                     except KeyboardInterrupt:
                         # Save progress before interrupting
                         if progress_state:
-                            progress_state.save_checkpoint(processed_files, files_processed, 
+                            progress_state.save_checkpoint(processed_files, files_processed,
                                                          file_count, original_size)
                         raise  # Propagate interrupt
 
@@ -521,9 +597,9 @@ class CompressionEngine:
                 memory_percent = psutil.virtual_memory().percent
                 cpu_count = os.cpu_count() or 4
                 workers = self.resource_monitor.adjust_workers()
-                
+
                 self.console.print(f"[cyan]System Resources: {memory_percent:.1f}% memory, {cpu_count} CPUs, {workers} workers")
-                
+
                 for root, dirs, files in os.walk(input_path):
                     for file in files:
                         file_path = Path(root) / file
@@ -562,14 +638,14 @@ class CompressionEngine:
                     # Use stream_writer for memory-efficient compression
                     with compressor.stream_writer(output_file._file) as writer:
                         while True:
-                            chunk = temp_tar.read(self.config.CHUNK_SIZE)
+                            chunk = temp_tar.read(self.config.chunk_size)
                             if not chunk:
                                 break
                             writer.write(chunk)
                             compressed_size += len(chunk)
 
                             # Allow for interruption during compression
-                            if compressed_size % (self.config.CHUNK_SIZE * 100) == 0:
+                            if compressed_size % (self.config.chunk_size * 100) == 0:
                                 await asyncio.sleep(0)
 
                 # Get actual compressed size from file
@@ -581,10 +657,10 @@ class CompressionEngine:
                 self.console.print("Progress: " + "━" * 32 + " 100%")
 
             end_time = time.time()
-            
+
             # Clean up progress state on successful completion
             progress_state.cleanup()
-            
+
             return original_size, compressed_size, end_time - start_time
 
         except KeyboardInterrupt:
@@ -790,9 +866,11 @@ class KZipApp:
 
     def __init__(self):
         self.console = Console()
-        self.config = CompressionConfig()
-        self.engine = CompressionEngine(self.console, self.config)
-        self.cli = KZipCLI()
+        try:
+            self.config = CompressionConfig.load_config()
+        except Exception:
+            # Fallback to default config if loading fails
+            self.config = CompressionConfig()
 
     def print_banner(self, verbose: bool):
         """Print application banner"""
@@ -933,9 +1011,7 @@ class KZipApp:
             self.print_banner(True)
             mode = "maximum compression" if args.max_compression else \
                    "maximum speed" if args.max_speed else "balanced"
-            worker_threads = min(8,
-                                 os.cpu_count()
-                                 or 4)  # Simulate worker threads
+            worker_threads = min(self.config.max_workers, os.cpu_count() or 4)
             max_memory = f"{self.config.MAX_MEMORY_MB}MB"
 
             self.console.print(f"Operation: Compression")
@@ -984,20 +1060,18 @@ class KZipApp:
         output_path = input_path.parent / base_name
 
         # Use improved archive detection
-        if verbose:
+        if args.verbose:
             self.console.print("[yellow]Analyzing compressed file structure...")
-            
-        is_archive = self.detect_archive_type(input_path)
-        
-        if verbose:
+
+        is_archive = self.engine.detect_archive_type(input_path)
+
+        if args.verbose:
             archive_type = "tar archive" if is_archive else "single file"
             self.console.print(f"[cyan]Detected content type: {archive_type}")
 
         if args.verbose:
             self.print_banner(True)
-            worker_threads = min(8,
-                                 os.cpu_count()
-                                 or 4)  # Simulate worker threads
+            worker_threads = min(self.config.max_workers, os.cpu_count() or 4)
             max_memory = "1GB"  # Decompression uses less memory
 
             self.console.print(f"Operation: Decompression")
