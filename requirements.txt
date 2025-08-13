@@ -1,0 +1,4 @@
+
+aiofiles>=24.1.0
+rich>=14.1.0
+zstandard>=0.23.0

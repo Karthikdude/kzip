@@ -1,0 +1,10 @@
+[kzip]
+name = "KZipTool"
+version = "0.1.0"
+description = "KZipTool is a command-line tool for compressing and decompressing files using the Zstandard (zstd) algorithm."
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=24.1.0",
+    "rich>=14.1.0",
+    "zstandard>=0.23.0",
+]
