@@ -414,7 +414,7 @@ This project is **open source**. Please review license terms before commercial u
 
 | Version | Release Date | Highlights |
 |---------|-------------|------------|
-| **v1.0.0** | 2024 | 🎉 Initial release with full feature set |
+| **v1.0.0** | 2025 | 🎉 Initial release with full feature set |
 | | | ✨ Zstandard compression with multiple modes |
 | | | ⚡ Asynchronous I/O for high performance |
 | | | 🎨 Professional terminal UI with progress tracking |
