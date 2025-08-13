@@ -27,7 +27,7 @@ try:
                                FileSizeColumn, TransferSpeedColumn)
     from rich.table import Table
     from rich.panel import Panel
-    from pydantic import BaseModel, validator
+    from pydantic import BaseModel, field_validator
 except ImportError as e:
     print(f"Required dependency missing: {e}")
     print("Please install required packages:")
@@ -58,7 +58,8 @@ class CompressionMode(BaseModel):
     level: int
     mode: Literal['speed', 'balanced', 'compression']
 
-    @validator('level')
+    @field_validator('level')
+    @classmethod
     def validate_level(cls, v):
         if not -100 <= v <= 22:
             raise ValueError('Invalid compression level')
