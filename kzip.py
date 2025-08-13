@@ -326,6 +326,189 @@ For more information, visit: https://github.com/Karthikdude/kzip
                 raise KZipError(f"File or directory not found: {args.data}")
 
 
+class SmartProgress:
+    """Enhanced progress display with real-time statistics and professional formatting"""
+
+    def __init__(self, console: Console, operation_type: str = "Processing"):
+        self.console = console
+        self.operation_type = operation_type
+        self.start_time = time.time()
+        self.last_update_time = time.time()
+        self.bytes_processed = 0
+        self.total_bytes = 0
+        self.files_processed = 0
+        self.total_files = 0
+        self.current_file = ""
+        self.compression_ratio = 1.0
+        self.speed_history = []  # For smoothing speed calculations
+        self.max_history = 10
+
+        # Progress bar components
+        self.progress = None
+        self.main_task = None
+        self.file_task = None
+
+    def start(self, total_files: int = 0, total_bytes: int = 0):
+        """Initialize progress display"""
+        self.total_files = total_files
+        self.total_bytes = total_bytes
+        self.start_time = time.time()
+
+        # Create rich progress display with multiple columns
+        self.progress = Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            FileSizeColumn(),
+            TextColumn("•"),
+            TransferSpeedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            TextColumn("•"),
+            TextColumn("[cyan]{task.fields[ratio]}"),
+            console=self.console,
+            transient=False
+        )
+
+        self.progress.start()
+
+        # Main progress task
+        self.main_task = self.progress.add_task(
+            f"[bold green]{self.operation_type}",
+            total=max(total_files, 1),
+            ratio="1.0:1",
+            current_file=""
+        )
+
+        # Current file task (if processing multiple files)
+        if total_files > 1:
+            self.file_task = self.progress.add_task(
+                "[dim]Current file",
+                total=100,
+                visible=False
+            )
+
+    def update_with_stats(self, files_completed: int = None, bytes_processed: int = None, 
+                         current_file: str = None, file_progress: float = None,
+                         original_size: int = None, compressed_size: int = None):
+        """Update progress with comprehensive statistics"""
+        current_time = time.time()
+
+        # Update counters
+        if files_completed is not None:
+            self.files_processed = files_completed
+        if bytes_processed is not None:
+            self.bytes_processed = bytes_processed
+        if current_file is not None:
+            self.current_file = current_file
+
+        # Calculate compression ratio
+        if original_size and compressed_size:
+            self.compression_ratio = original_size / compressed_size if compressed_size > 0 else 1.0
+
+        # Calculate speed (smoothed)
+        time_diff = current_time - self.last_update_time
+        if time_diff > 0 and bytes_processed:
+            current_speed = (bytes_processed - getattr(self, '_last_bytes', 0)) / time_diff
+            self.speed_history.append(current_speed)
+            if len(self.speed_history) > self.max_history:
+                self.speed_history.pop(0)
+
+            self._last_bytes = bytes_processed
+
+        self.last_update_time = current_time
+
+        # Calculate ETA
+        if self.files_processed > 0 and self.total_files > 0:
+            files_remaining = self.total_files - self.files_processed
+            if files_remaining > 0:
+                elapsed = current_time - self.start_time
+                rate = self.files_processed / elapsed
+                eta_seconds = files_remaining / rate if rate > 0 else 0
+            else:
+                eta_seconds = 0
+        else:
+            eta_seconds = 0
+
+        # Format current file name (truncate if too long)
+        display_file = current_file or ""
+        if len(display_file) > 50:
+            display_file = "..." + display_file[-47:]
+
+        # Update main progress
+        if self.progress and self.main_task is not None:
+            self.progress.update(
+                self.main_task,
+                completed=self.files_processed,
+                description=f"[bold green]{self.operation_type} • [white]{display_file}",
+                ratio=f"{self.compression_ratio:.1f}:1"
+            )
+
+            # Update file progress if available
+            if self.file_task is not None and file_progress is not None:
+                self.progress.update(
+                    self.file_task,
+                    completed=int(file_progress),
+                    visible=True
+                )
+
+    def update_memory_stats(self, memory_mb: float, cpu_percent: float = None):
+        """Update with system resource information"""
+        if self.progress and self.main_task is not None:
+            resource_info = f"[dim]RAM: {memory_mb:.0f}MB"
+            if cpu_percent is not None:
+                resource_info += f" • CPU: {cpu_percent:.0f}%"
+
+            # You could add this as a separate task or incorporate into description
+            # For now, we'll keep it simple and not clutter the main display
+            pass
+
+    def show_phase(self, phase_name: str, details: str = ""):
+        """Display current processing phase"""
+        if self.progress and self.main_task is not None:
+            phase_text = f"[bold yellow]{phase_name}"
+            if details:
+                phase_text += f" • [white]{details}"
+
+            self.progress.update(
+                self.main_task,
+                description=phase_text
+            )
+
+    def finish(self, success: bool = True):
+        """Complete progress display"""
+        if self.progress:
+            if success:
+                final_desc = f"[bold green]✓ {self.operation_type} Complete"
+            else:
+                final_desc = f"[bold red]✗ {self.operation_type} Failed"
+
+            if self.main_task is not None:
+                self.progress.update(
+                    self.main_task,
+                    description=final_desc,
+                    completed=self.total_files or self.files_processed
+                )
+
+            time.sleep(0.5)  # Brief pause to show completion
+            self.progress.stop()
+
+    def get_stats_summary(self) -> dict:
+        """Get comprehensive statistics for final summary"""
+        elapsed = time.time() - self.start_time
+        avg_speed = sum(self.speed_history) / len(self.speed_history) if self.speed_history else 0
+
+        return {
+            'elapsed_time': elapsed,
+            'files_processed': self.files_processed,
+            'bytes_processed': self.bytes_processed,
+            'average_speed': avg_speed,
+            'compression_ratio': self.compression_ratio,
+            'files_per_second': self.files_processed / elapsed if elapsed > 0 else 0
+        }
+
+
 class CompressionEngine:
     """Core compression and decompression engine"""
 
@@ -505,8 +688,9 @@ class CompressionEngine:
 
     def _build_tar_archive(self, temp_tar_file: io.BytesIO, input_path: Path,
                            verbose: bool, start_time: float,
-                           file_count: int, progress_state: Optional[ProgressState] = None) -> None:
-        """Helper to build tar archive with resume capability"""
+                           file_count: int, progress_state: Optional[ProgressState] = None,
+                           smart_progress: Optional[SmartProgress] = None) -> None:
+        """Helper to build tar archive with resume capability and enhanced progress"""
         files_processed = 0
         current_file = ""
         original_size = 0
@@ -548,10 +732,19 @@ class CompressionEngine:
                             progress_state.save_checkpoint(processed_files, files_processed,
                                                          file_count, original_size)
 
-                        if verbose and files_processed % 100 == 0:
+                        # Update smart progress if available
+                        if smart_progress and verbose:
+                            memory_mb = self.resource_monitor.get_memory_usage_mb()
+                            smart_progress.update_with_stats(
+                                files_completed=files_processed,
+                                bytes_processed=original_size,
+                                current_file=current_file
+                            )
+                            smart_progress.update_memory_stats(memory_mb)
+                        elif verbose and files_processed % 100 == 0:
+                            # Fallback to simple progress display
                             elapsed = time.time() - start_time
-                            speed = (original_size / 1024 / 1024
-                                     ) / elapsed if elapsed > 0 else 0
+                            speed = (original_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
                             memory_mb = self.resource_monitor.get_memory_usage_mb()
                             progress_line = f"Files processed: {files_processed:,}/{file_count:,} | Current: {current_file} | Speed: {speed:.1f} MB/s | Memory: {memory_mb:.0f}MB"
                             if len(progress_line) > 120:
@@ -591,6 +784,8 @@ class CompressionEngine:
             file_count = 0
             total_size = 0
 
+            # Initialize smart progress for verbose mode
+            smart_progress = None
             if verbose:
                 self.console.print("[yellow]Scanning directory structure...")
                 # Check system resources before starting
@@ -613,22 +808,25 @@ class CompressionEngine:
                     f"Found {file_count:,} files ({total_size / 1024 / 1024:.1f} MB total)"
                 )
 
+                # Initialize smart progress
+                smart_progress = SmartProgress(self.console, "Archive Creation")
+                smart_progress.start(total_files=file_count, total_bytes=total_size)
+
             # Create tar archive and compress using streaming
             with tempfile.NamedTemporaryFile() as temp_tar:
                 # Build tar archive using asyncio.to_thread to avoid blocking
                 await asyncio.to_thread(self._build_tar_archive,
                                         temp_tar, input_path, verbose,
-                                        start_time, file_count, progress_state)
+                                        start_time, file_count, progress_state, smart_progress)
 
                 original_size = temp_tar.tell()
 
-                # Show finishing message at 99% before final compression step
-                if verbose:
-                    print("\r" + " " * 120 + "\r",
-                          end="")  # Clear the progress line completely
-                    self.console.print(
-                        "[cyan]Processing completed (99%), finishing compression..."
-                    )
+                # Show finishing message and update progress
+                if verbose and smart_progress:
+                    smart_progress.show_phase("Compression", "Finalizing archive...")
+                elif verbose:
+                    print("\r" + " " * 120 + "\r", end="")  # Clear the progress line
+                    self.console.print("[cyan]Processing completed (99%), finishing compression...")
 
                 # Use streaming compression to avoid loading entire tar into memory
                 temp_tar.seek(0)
@@ -651,9 +849,10 @@ class CompressionEngine:
                 # Get actual compressed size from file
                 compressed_size = output_path.stat().st_size
 
-            if verbose:
-                print("\r" + " " * 120 + "\r",
-                      end="")  # Clear any remaining progress
+            if verbose and smart_progress:
+                smart_progress.finish(success=True)
+            elif verbose:
+                print("\r" + " " * 120 + "\r", end="")  # Clear any remaining progress
                 self.console.print("Progress: " + "━" * 32 + " 100%")
 
             end_time = time.time()
@@ -872,6 +1071,10 @@ class KZipApp:
             # Fallback to default config if loading fails
             self.config = CompressionConfig()
 
+        # Initialize CLI and engine
+        self.cli = KZipCLI()
+        self.engine = CompressionEngine(self.console, self.config)
+
     def print_banner(self, verbose: bool):
         """Print application banner"""
         if verbose:
@@ -888,42 +1091,80 @@ class KZipApp:
                       duration: float,
                       files_count: Optional[int] = None,
                       errors: int = 0,
-                      files_skipped: int = 0):
-        """Print operation summary in professional format"""
-        self.console.print(f"\n{operation} Summary:")
+                      files_skipped: int = 0,
+                      smart_progress: Optional[SmartProgress] = None):
+        """Print enhanced operation summary in professional format"""
+
+        # Create a professional summary table
+        table = Table(title=f"\n🎯 {operation} Summary", show_header=False, box=None, padding=(0, 1))
+        table.add_column("Metric", style="bold cyan", width=20)
+        table.add_column("Value", style="white", width=30)
 
         if operation == "Compression":
             ratio = original_size / final_size if final_size > 0 else 0
-            self.console.print(
-                f"- Original size: {original_size / 1024 / 1024:.1f} MB")
-            self.console.print(
-                f"- Compressed size: {final_size / 1024 / 1024:.1f} MB")
-            self.console.print(f"- Compression ratio: {ratio:.1f}:1")
+            space_saved = original_size - final_size
+            space_saved_percent = (space_saved / original_size * 100) if original_size > 0 else 0
+
+            table.add_row("📁 Original size", f"{original_size / 1024 / 1024:.1f} MB")
+            table.add_row("📦 Compressed size", f"{final_size / 1024 / 1024:.1f} MB")
+            table.add_row("🔥 Compression ratio", f"[bold green]{ratio:.1f}:1")
+            table.add_row("💾 Space saved", f"[bold yellow]{space_saved / 1024 / 1024:.1f} MB ({space_saved_percent:.1f}%)")
         else:
             ratio = final_size / original_size if original_size > 0 else 0
-            self.console.print(
-                f"- Compressed size: {original_size / 1024 / 1024:.1f} MB")
-            self.console.print(
-                f"- Extracted size: {final_size / 1024 / 1024:.1f} MB")
-            self.console.print(f"- Expansion ratio: {ratio:.1f}:1")
+            table.add_row("📦 Compressed size", f"{original_size / 1024 / 1024:.1f} MB")
+            table.add_row("📁 Extracted size", f"{final_size / 1024 / 1024:.1f} MB")
+            table.add_row("📈 Expansion ratio", f"[bold green]{ratio:.1f}:1")
 
+        # Time and performance metrics
         minutes = int(duration // 60)
         seconds = int(duration % 60)
-        self.console.print(f"- Total time: {minutes}m {seconds}s")
+        time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+        table.add_row("⏱️  Total time", f"[bold cyan]{time_str}")
 
         if duration > 0:
             speed = (max(original_size, final_size) / 1024 / 1024) / duration
-            self.console.print(f"- Average speed: {speed:.1f} MB/s")
+            table.add_row("🚀 Average speed", f"[bold magenta]{speed:.1f} MB/s")
 
+        # File statistics
         if files_count is not None:
             if operation == "Compression":
-                self.console.print(f"- Files processed: {files_count:,}")
+                table.add_row("📋 Files processed", f"[bold white]{files_count:,}")
                 if files_skipped > 0:
-                    self.console.print(f"- Files skipped: {files_skipped:,}")
-            else:
-                self.console.print(f"- Files extracted: {files_count:,}")
+                    table.add_row("⚠️  Files skipped", f"[yellow]{files_skipped:,}")
 
-        self.console.print(f"- Errors: {errors}")
+                # Add files per second if we have the data
+                if duration > 0:
+                    files_per_sec = files_count / duration
+                    table.add_row("📊 Processing rate", f"{files_per_sec:.1f} files/sec")
+            else:
+                table.add_row("📋 Files extracted", f"[bold white]{files_count:,}")
+
+        # System and error info
+        if smart_progress:
+            stats = smart_progress.get_stats_summary()
+            if stats.get('average_speed', 0) > 0:
+                table.add_row("⚡ Peak speed", f"{stats['average_speed'] / 1024 / 1024:.1f} MB/s")
+
+        # Error reporting
+        if errors > 0:
+            table.add_row("❌ Errors", f"[bold red]{errors}")
+        else:
+            table.add_row("✅ Status", "[bold green]Success")
+
+        self.console.print(table)
+
+        # Add performance insights
+        if operation == "Compression" and ratio > 0:
+            if ratio >= 10:
+                insight = "🌟 Excellent compression achieved!"
+            elif ratio >= 5:
+                insight = "👍 Good compression ratio"
+            elif ratio >= 2:
+                insight = "✓ Moderate compression"
+            else:
+                insight = "ℹ️ Limited compression (file may already be compressed)"
+
+            self.console.print(f"\n[dim]{insight}[/dim]")
 
     async def handle_cleanup_prompt(self, compressed_file: Path,
                                     auto_remove: bool) -> bool:
