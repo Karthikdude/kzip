@@ -49,7 +49,7 @@ class CompressionConfig:
     CHUNK_SIZE = 65536  # 64KB
 
     # Memory limits
-    MAX_MEMORY_MB = 512
+    MAX_MEMORY_MB = 3072  # 3GB
 
 
 class KZipCLI:
