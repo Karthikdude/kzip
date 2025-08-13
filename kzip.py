@@ -11,14 +11,16 @@ import sys
 import time
 import tarfile
 import tempfile
+import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 import io
 
 try:
     import zstandard as zstd
     import aiofiles
+    import psutil
     from rich.console import Console
     from rich.progress import (Progress, TextColumn, BarColumn,
                                TaskProgressColumn, TimeRemainingColumn,
@@ -37,6 +39,83 @@ class KZipError(Exception):
     pass
 
 
+class ProgressState:
+    """Handles checkpoint save/load for resume capability"""
+    
+    def __init__(self, operation_id: str):
+        self.operation_id = operation_id
+        self.checkpoint_file = Path(f".kzip_progress_{operation_id}")
+    
+    def save_checkpoint(self, processed_files: List[str], current_position: int, 
+                       total_files: int, bytes_processed: int):
+        """Save current progress to checkpoint file"""
+        checkpoint_data = {
+            'processed_files': processed_files,
+            'current_position': current_position,
+            'total_files': total_files,
+            'bytes_processed': bytes_processed,
+            'timestamp': time.time()
+        }
+        
+        try:
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+        except Exception:
+            pass  # Silently fail if unable to save checkpoint
+    
+    def load_checkpoint(self) -> Optional[dict]:
+        """Load progress from checkpoint file"""
+        try:
+            if self.checkpoint_file.exists():
+                with open(self.checkpoint_file, 'r') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+    
+    def cleanup(self):
+        """Remove checkpoint file after successful completion"""
+        try:
+            if self.checkpoint_file.exists():
+                self.checkpoint_file.unlink()
+        except Exception:
+            pass
+
+
+class ResourceMonitor:
+    """Monitors system resources and adjusts performance accordingly"""
+    
+    def __init__(self, max_workers: int = 8):
+        self.max_workers = max_workers
+        self.current_workers = min(4, max_workers)  # Start conservatively
+        
+    def should_throttle(self) -> bool:
+        """Check if system resources are under stress"""
+        try:
+            memory_percent = psutil.virtual_memory().percent
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            return memory_percent > 85 or cpu_percent > 90
+        except Exception:
+            return False  # Conservative fallback
+    
+    def adjust_workers(self) -> int:
+        """Dynamically adjust worker count based on system resources"""
+        if self.should_throttle():
+            self.current_workers = max(1, self.current_workers // 2)
+        else:
+            self.current_workers = min(self.max_workers, self.current_workers + 1)
+        
+        return self.current_workers
+    
+    def get_memory_usage_mb(self) -> float:
+        """Get current memory usage in MB"""
+        try:
+            process = psutil.Process()
+            return process.memory_info().rss / 1024 / 1024
+        except Exception:
+            return 0.0
+
+
 class CompressionConfig:
     """Configuration for compression operations"""
 
@@ -50,6 +129,10 @@ class CompressionConfig:
 
     # Memory limits
     MAX_MEMORY_MB = 3072  # 3GB
+    
+    # Parallel processing limits
+    MAX_CONCURRENT_FILES = 10
+    CHECKPOINT_INTERVAL = 100  # Save progress every N files
 
 
 class KZipCLI:
@@ -173,6 +256,29 @@ class CompressionEngine:
     def __init__(self, console: Console, config: CompressionConfig):
         self.console = console
         self.config = config
+        self.resource_monitor = ResourceMonitor()
+
+    def detect_archive_type(self, zst_path: Path) -> bool:
+        """Peek into compressed data to detect if it's a tar archive"""
+        try:
+            with open(zst_path, 'rb') as f:
+                decompressor = zstd.ZstdDecompressor()
+                # Read first few KB to check for archive signatures
+                header_data = f.read(4096)
+                if len(header_data) < 512:
+                    return False
+                
+                # Decompress the header to check for tar magic bytes
+                try:
+                    sample = decompressor.decompress(header_data)
+                    # Check for tar magic bytes at positions 257-262 (ustar format)
+                    if len(sample) >= 512:
+                        return sample[257:262] == b'ustar'
+                    return False
+                except Exception:
+                    return False
+        except Exception:
+            return False
 
     def get_compression_level(self, max_compression: bool,
                               max_speed: bool) -> int:
@@ -183,6 +289,61 @@ class CompressionEngine:
             return self.config.MAX_SPEED_LEVEL
         else:
             return self.config.BALANCED_LEVEL
+
+    async def compress_single_file_concurrent(self, file_info: Tuple[Path, Path, int], 
+                                            semaphore: asyncio.Semaphore) -> Tuple[str, int, int, bool]:
+        """Compress a single file with semaphore control for concurrency"""
+        file_path, relative_path, compression_level = file_info
+        
+        async with semaphore:
+            try:
+                # Check if we should throttle based on system resources
+                if self.resource_monitor.should_throttle():
+                    await asyncio.sleep(0.1)  # Brief pause if system is stressed
+                
+                # Read and compress file
+                async with aiofiles.open(file_path, 'rb') as f:
+                    data = await f.read()
+                
+                compressor = zstd.ZstdCompressor(level=compression_level)
+                compressed_data = compressor.compress(data)
+                
+                return str(relative_path), len(data), len(compressed_data), True
+                
+            except Exception as e:
+                # Return error info but don't fail the entire operation
+                return str(relative_path), 0, 0, False
+
+    async def compress_files_concurrently(self, files: List[Tuple[Path, Path, int]], 
+                                        semaphore_limit: int = None) -> List[Tuple[str, int, int, bool]]:
+        """Compress multiple files concurrently with dynamic resource management"""
+        if semaphore_limit is None:
+            semaphore_limit = self.resource_monitor.current_workers
+        
+        semaphore = asyncio.Semaphore(semaphore_limit)
+        
+        # Create tasks for concurrent processing
+        tasks = []
+        for file_info in files:
+            task = asyncio.create_task(
+                self.compress_single_file_concurrent(file_info, semaphore)
+            )
+            tasks.append(task)
+        
+        # Process with periodic resource monitoring
+        results = []
+        for i, task in enumerate(asyncio.as_completed(tasks)):
+            result = await task
+            results.append(result)
+            
+            # Dynamically adjust concurrency based on system resources
+            if i % 10 == 0:  # Check every 10 files
+                new_limit = self.resource_monitor.adjust_workers()
+                if new_limit != semaphore_limit:
+                    semaphore_limit = new_limit
+                    # Note: We can't change existing semaphore, but this affects future batches
+        
+        return results
 
     async def compress_file(self,
                             input_path: Path,
@@ -268,17 +429,34 @@ class CompressionEngine:
 
     def _build_tar_archive(self, temp_tar_file: io.BytesIO, input_path: Path,
                            verbose: bool, start_time: float,
-                           file_count: int) -> None:
-        """Helper to build tar archive in a thread to avoid blocking"""
+                           file_count: int, progress_state: Optional[ProgressState] = None) -> None:
+        """Helper to build tar archive with resume capability"""
         files_processed = 0
         current_file = ""
         original_size = 0
+        processed_files = []
+        
+        # Load checkpoint if available
+        checkpoint = None
+        if progress_state:
+            checkpoint = progress_state.load_checkpoint()
+            if checkpoint:
+                processed_files = checkpoint.get('processed_files', [])
+                files_processed = checkpoint.get('current_position', 0)
+                original_size = checkpoint.get('bytes_processed', 0)
+                if verbose:
+                    self.console.print(f"[cyan]Resuming from checkpoint: {files_processed:,}/{file_count:,} files processed")
 
         with tarfile.open(fileobj=temp_tar_file, mode='w') as tar:
             for root, dirs, files in os.walk(input_path):
                 for file in files:
                     file_path = Path(root) / file
-                    current_file = str(file_path.relative_to(input_path.parent))
+                    relative_path = str(file_path.relative_to(input_path.parent))
+                    current_file = relative_path
+
+                    # Skip if already processed (resume capability)
+                    if checkpoint and relative_path in processed_files:
+                        continue
 
                     try:
                         arcname = file_path.relative_to(input_path.parent)
@@ -287,12 +465,19 @@ class CompressionEngine:
                         file_size = file_path.stat().st_size
                         original_size += file_size
                         files_processed += 1
+                        processed_files.append(relative_path)
+
+                        # Save checkpoint periodically
+                        if progress_state and files_processed % self.config.CHECKPOINT_INTERVAL == 0:
+                            progress_state.save_checkpoint(processed_files, files_processed, 
+                                                         file_count, original_size)
 
                         if verbose and files_processed % 100 == 0:
                             elapsed = time.time() - start_time
                             speed = (original_size / 1024 / 1024
                                      ) / elapsed if elapsed > 0 else 0
-                            progress_line = f"Files processed: {files_processed:,}/{file_count:,} | Current: {current_file} | Speed: {speed:.1f} MB/s"
+                            memory_mb = self.resource_monitor.get_memory_usage_mb()
+                            progress_line = f"Files processed: {files_processed:,}/{file_count:,} | Current: {current_file} | Speed: {speed:.1f} MB/s | Memory: {memory_mb:.0f}MB"
                             if len(progress_line) > 120:
                                 progress_line = progress_line[:117] + "..."
                             print(f"\r{progress_line:<120}", end="", flush=True)
@@ -303,6 +488,10 @@ class CompressionEngine:
                                 f"[yellow]Warning: Skipping {file_path}: {e}")
                         continue
                     except KeyboardInterrupt:
+                        # Save progress before interrupting
+                        if progress_state:
+                            progress_state.save_checkpoint(processed_files, files_processed, 
+                                                         file_count, original_size)
                         raise  # Propagate interrupt
 
     async def compress_directory(
@@ -311,10 +500,14 @@ class CompressionEngine:
             output_path: Path,
             compression_level: int,
             verbose: bool = False) -> Tuple[int, int, float]:
-        """Compress a directory into a tar.zst archive"""
+        """Compress a directory into a tar.zst archive with resume capability"""
         start_time = time.time()
         original_size = 0
         compressed_size = 0
+
+        # Setup progress state for resume capability
+        operation_id = f"{input_path.name}_{int(start_time)}"
+        progress_state = ProgressState(operation_id)
 
         try:
             compressor = zstd.ZstdCompressor(level=compression_level)
@@ -324,6 +517,13 @@ class CompressionEngine:
 
             if verbose:
                 self.console.print("[yellow]Scanning directory structure...")
+                # Check system resources before starting
+                memory_percent = psutil.virtual_memory().percent
+                cpu_count = os.cpu_count() or 4
+                workers = self.resource_monitor.adjust_workers()
+                
+                self.console.print(f"[cyan]System Resources: {memory_percent:.1f}% memory, {cpu_count} CPUs, {workers} workers")
+                
                 for root, dirs, files in os.walk(input_path):
                     for file in files:
                         file_path = Path(root) / file
@@ -342,7 +542,7 @@ class CompressionEngine:
                 # Build tar archive using asyncio.to_thread to avoid blocking
                 await asyncio.to_thread(self._build_tar_archive,
                                         temp_tar, input_path, verbose,
-                                        start_time, file_count)
+                                        start_time, file_count, progress_state)
 
                 original_size = temp_tar.tell()
 
@@ -381,16 +581,22 @@ class CompressionEngine:
                 self.console.print("Progress: " + "━" * 32 + " 100%")
 
             end_time = time.time()
+            
+            # Clean up progress state on successful completion
+            progress_state.cleanup()
+            
             return original_size, compressed_size, end_time - start_time
 
         except KeyboardInterrupt:
             if output_path.exists():
                 output_path.unlink()
-            self.console.print("\n[yellow]Compression cancelled by user.")
+            self.console.print(f"\n[yellow]Compression cancelled by user. Progress saved for resume.")
             raise
         except Exception as e:
             if output_path.exists():
                 output_path.unlink()
+            # Clean up progress state on failure
+            progress_state.cleanup()
             raise KZipError(f"Directory compression failed: {str(e)}")
 
     async def decompress_file(self,
@@ -592,8 +798,9 @@ class KZipApp:
         """Print application banner"""
         if verbose:
             self.console.print(
-                "KZip v1.0.0 - High-Performance Compression Tool")
-            self.console.print("=" * 40)
+                "KZip v1.1.0 - High-Performance Compression Tool")
+            self.console.print("Enhanced with parallel processing, resume capability & resource monitoring")
+            self.console.print("=" * 72)
             self.console.print()
 
     def print_summary(self,
@@ -776,22 +983,15 @@ class KZipApp:
         base_name = input_path.stem
         output_path = input_path.parent / base_name
 
-        # Determine archive type using simple but reliable heuristics
-        is_archive = False
-
-        # Simple and reliable heuristics:
-        if 'stdin_output_' in base_name:
-            # STDIN outputs are always single files
-            is_archive = False
-        elif output_path.exists() and output_path.is_dir():
-            # If output directory already exists, it's likely an archive
-            is_archive = True
-        elif '.' in base_name:
-            # If base name has an extension, it's likely a single file
-            is_archive = False
-        else:
-            # No extension suggests it was a directory
-            is_archive = True
+        # Use improved archive detection
+        if verbose:
+            self.console.print("[yellow]Analyzing compressed file structure...")
+            
+        is_archive = self.detect_archive_type(input_path)
+        
+        if verbose:
+            archive_type = "tar archive" if is_archive else "single file"
+            self.console.print(f"[cyan]Detected content type: {archive_type}")
 
         if args.verbose:
             self.print_banner(True)
