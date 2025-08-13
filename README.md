@@ -414,7 +414,22 @@ This project is **open source**. Please review license terms before commercial u
 
 | Version | Release Date | Highlights |
 |---------|-------------|------------|
-| **v1.0.0** | 2025 | 🎉 Initial release with full feature set |
+| **v1.2.0** | 2025 | 🚀 Major enhancements |
+| | | ⚙️ TOML/INI configuration support |
+| | | 🔄 Parallel processing with dynamic resource management |
+| | | 🔍 Smart archive detection |
+| | | ✅ Pydantic validation for settings |
+| | | 🔒 SHA256 integrity verification |
+| | | ⏱️ Enhanced progress tracking with real-time stats |
+| | | 🛠️ Configuration file support (kzip.toml, ~/.kziprc) |
+| | | 📊 Improved summary output with compression insights |
+| **v1.1.0** | 2025 | Performance & Reliability |
+| | | ⚡ Parallel file processing |
+| | | 🔄 Resume capability with checkpoints |
+| | | 📊 Resource monitoring and throttling |
+| | | 🎯 Improved archive detection |
+| | | 🛡️ Better error handling |
+| **v1.0.0** | 2025 | Initial Release |
 | | | ✨ Zstandard compression with multiple modes |
 | | | ⚡ Asynchronous I/O for high performance |
 | | | 🎨 Professional terminal UI with progress tracking |

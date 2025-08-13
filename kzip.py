@@ -31,7 +31,7 @@ try:
 except ImportError as e:
     print(f"Required dependency missing: {e}")
     print("Please install required packages:")
-    print("pip install zstandard aiofiles rich pydantic")
+    print("pip install zstandard aiofiles rich pydantic psutil toml")
     sys.exit(1)
 
 
