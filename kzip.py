@@ -31,7 +31,7 @@ try:
 except ImportError as e:
     print(f"Required dependency missing: {e}")
     print("Please install required packages:")
-    print("pip install zstandard aiofiles rich pydantic psutil toml")
+    print("pip install zstandard aiofiles rich pydantic")
     sys.exit(1)
 
 
@@ -523,20 +523,30 @@ class CompressionEngine:
         try:
             with open(zst_path, 'rb') as f:
                 decompressor = zstd.ZstdDecompressor()
-                # Read first few KB to check for archive signatures
-                header_data = f.read(4096)
-                if len(header_data) < 512:
-                    return False
-
-                # Decompress the header to check for tar magic bytes
+                
+                # For streaming compressed data, we need to use stream reader
                 try:
-                    sample = decompressor.decompress(header_data)
-                    # Check for tar magic bytes at positions 257-262 (ustar format)
-                    if len(sample) >= 512:
-                        return sample[257:262] == b'ustar'
-                    return False
+                    with decompressor.stream_reader(f) as reader:
+                        # Read first 1KB to check for tar signatures
+                        sample = reader.read(1024)
+                        if len(sample) >= 512:
+                            # Check for tar magic bytes at positions 257-262 (ustar format)
+                            return sample[257:262] == b'ustar'
+                        return False
                 except Exception:
-                    return False
+                    # Fallback: try direct decompression of header
+                    f.seek(0)
+                    header_data = f.read(8192)  # Read more data for better detection
+                    if len(header_data) < 512:
+                        return False
+                    
+                    try:
+                        sample = decompressor.decompress(header_data)
+                        if len(sample) >= 512:
+                            return sample[257:262] == b'ustar'
+                        return False
+                    except Exception:
+                        return False
         except Exception:
             return False
 
@@ -954,22 +964,36 @@ class CompressionEngine:
             if verbose:
                 self.console.print("[yellow]Analyzing archive structure...")
 
-            # Decompress to temporary tar file first
+            # Decompress to temporary tar file using streaming for large files
             with tempfile.NamedTemporaryFile() as temp_tar:
-                async with aiofiles.open(input_path, 'rb') as input_file:
-                    compressed_data = await input_file.read()
+                try:
+                    # Try streaming decompression first (for files compressed with streaming)
+                    with open(input_path, 'rb') as input_file:
+                        with decompressor.stream_reader(input_file) as reader:
+                            while True:
+                                chunk = reader.read(self.config.chunk_size)
+                                if not chunk:
+                                    break
+                                temp_tar.write(chunk)
+                                decompressed_size += len(chunk)
+                except Exception:
+                    # Fallback to non-streaming decompression
+                    temp_tar.seek(0)
+                    temp_tar.truncate()
+                    decompressed_size = 0
+                    
+                    async with aiofiles.open(input_path, 'rb') as input_file:
+                        compressed_data = await input_file.read()
 
-                    # Decompress the data with better error handling
-                    try:
-                        decompressed_data = decompressor.decompress(
-                            compressed_data)
-                    except Exception as decomp_error:
-                        raise KZipError(
-                            f"Invalid or corrupted archive: {decomp_error}")
-                    decompressed_size = len(decompressed_data)
+                        # Decompress the data with better error handling
+                        try:
+                            decompressed_data = decompressor.decompress(compressed_data)
+                        except Exception as decomp_error:
+                            raise KZipError(f"Invalid or corrupted archive: {decomp_error}")
+                        decompressed_size = len(decompressed_data)
 
-                    # Write to temporary tar file
-                    temp_tar.write(decompressed_data)
+                        # Write to temporary tar file
+                        temp_tar.write(decompressed_data)
 
                 # Extract tar archive
                 temp_tar.seek(0)
